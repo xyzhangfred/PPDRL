@@ -28,7 +28,7 @@ torch.manual_seed(0)
 np.random.seed(0)
 EPSILON = 1e-10
 example_sentence = "This is incredible! I love it, this is the best chicken I have ever had."
-max_length_seq = 100
+max_length_seq = 128
 
 
 class Discriminator(torch.nn.Module):
@@ -51,10 +51,11 @@ class Discriminator(torch.nn.Module):
             self.tokenizer = BertTokenizer.from_pretrained(pretrained_model)
             self.encoder = BertModel.from_pretrained(pretrained_model)
             self.embed_size = self.encoder.config.hidden_size
-        else:
-            raise ValueError(
-                "{} model not yet supported".format(pretrained_model)
-            )
+        elif ("finetune" in pretrained_model):
+            ###presume using finetuned bert-base-uncased
+            self.tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
+            self.encoder = BertModel.from_pretrained(pretrained_model, output_hidden_states = False)
+            self.embed_size = self.encoder.config.hidden_size
         if classifier_head:
             self.classifier_head = classifier_head
         else:
@@ -84,9 +85,7 @@ class Discriminator(torch.nn.Module):
             hidden, _ = self.encoder.transformer(x)
         else:
             # for bert
-            # TODO Here they are using the average hidden representation instead of [CLS]? Is there a reason?
-            ## I see, 
-            hidden, pooled_output = self.encoder(x)
+            hidden, _ = self.encoder(x)
         masked_hidden = hidden * mask
         avg_hidden = torch.sum(masked_hidden, dim=1) / (
                 torch.sum(mask, dim=1).detach() + EPSILON
@@ -229,7 +228,7 @@ def predict(input_sentence, model, classes, cached=False, device='cpu'):
         input_t = model.avg_representation(input_t)
 
     log_probs = model(input_t).data.cpu().numpy().flatten().tolist()
-    print("Input sentence:", input_sentence)
+    # print("Input sentence:", input_sentence)
     print("Predictions:", ", ".join(
         "{}: {:.4f}".format(c, math.exp(log_prob)) for c, log_prob in
         zip(classes, log_probs)
@@ -261,19 +260,19 @@ def get_cached_data_loader(dataset, batch_size, discriminator,
     return data_loader
 
 
-def get_idx2class(dataset_fp):
+def get_idx2class(dataset_fp, label_col = 1):
     classes = set()
     with open(dataset_fp) as f:
         csv_reader = csv.reader(f, delimiter="\t")
         for row in tqdm(csv_reader, ascii=True):
             if row:
-                classes.add(row[0])
+                classes.add(row[label_col])
 
     return sorted(classes)
 
 
 def get_generic_dataset(dataset_fp, tokenizer, device,
-                        idx2class=None, add_eos_token=False):
+                        idx2class=None, add_eos_token=False, label_col = 1, text_col = 0):
     if not idx2class:
         idx2class = get_idx2class(dataset_fp)
     class2idx = {c: i for i, c in enumerate(idx2class)}
@@ -284,15 +283,14 @@ def get_generic_dataset(dataset_fp, tokenizer, device,
         csv_reader = csv.reader(f, delimiter="\t")
         for i, row in enumerate(tqdm(csv_reader, ascii=True)):
             if row:
-                label = row[0]
-                text = row[1]
+                label = row[label_col]
+                text = row[text_col]
 
                 try:
                     seq = tokenizer.encode(text)
                     if (len(seq) < max_length_seq):
                         if add_eos_token:
-                            #TODO Why did they use [50256], vocab size? needs to be changed
-                            seq = [tokenizer.eos_token_id] + seq
+                            seq = [50256] + seq
                         seq = torch.tensor(
                             seq,
                             device=device,
@@ -330,6 +328,7 @@ def train_discriminator(
         output_fp='.'
 ):
     device = "cuda" if torch.cuda.is_available() and not no_cuda else "cpu"
+    # If bert then do not add? Why?
     add_eos_token = pretrained_model.startswith("gpt2")
 
     if save_model:
@@ -365,10 +364,8 @@ def train_discriminator(
             fine_grained=True,
             train_subtrees=True,
         )
-
         x = []
         y = []
-        #preprocess dataset 
         for i in trange(len(train_data), ascii=True):
             seq = TreebankWordDetokenizer().detokenize(
                 vars(train_data[i])["text"]
@@ -618,9 +615,9 @@ def train_discriminator(
         test_losses.append(test_loss)
         test_accuracies.append(test_accuracy)
 
-        print("\nExample prediction")
-        predict(example_sentence, discriminator, idx2class,
-                cached=cached, device=device)
+        # print("\nExample prediction")
+        # predict(example_sentence, discriminator, idx2class,
+        #         cached=cached, device=device)
 
         if save_model:
             # torch.save(discriminator.state_dict(),
@@ -687,11 +684,11 @@ if __name__ == "__main__":
     parser.add_argument("--dataset_fp", type=str, default="",
                         help="File path of the dataset to use. "
                              "Needed only in case of generic datadset")
-    parser.add_argument("--pretrained_model", type=str, default="gpt2-medium",
+    parser.add_argument("--pretrained_model", type=str, default="bert-base-uncased",
                         help="Pretrained model to use as encoder")
-    parser.add_argument("--epochs", type=int, default=10, metavar="N",
+    parser.add_argument("--epochs", type=int, default=3, metavar="N",
                         help="Number of training epochs")
-    parser.add_argument("--learning_rate", type=float, default=0.0001,
+    parser.add_argument("--learning_rate", type=float, default=0.001,
                         help="Learnign rate")
     parser.add_argument("--batch_size", type=int, default=64, metavar="N",
                         help="input batch size for training (default: 64)")

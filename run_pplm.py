@@ -137,6 +137,8 @@ def perturb_past(
         verbosity_level=REGULAR
 ):
     # Generate inital perturbed past
+    
+    #has the same shape as past
     grad_accumulator = [
         (np.zeros(p.shape).astype("float32"))
         for p in past
@@ -159,6 +161,8 @@ def perturb_past(
     _, _, _, curr_length, _ = past[0].shape
 
     if curr_length > window_length and window_length > 0:
+        ##only look back for a certain window? This could be a problem when we are using bert instead where we have 
+        ##to look at the whole sentence
         ones_key_val_shape = (
                 tuple(past[0].shape[:-2])
                 + tuple([window_length])
@@ -203,9 +207,11 @@ def perturb_past(
             dim=1
         ).detach()
         # TODO: Check the layer-norm consistency of this with trained discriminator (Sumanth)
+        # use this logits to calculate loss function
         logits = all_logits[:, -1, :]
         probs = F.softmax(logits, dim=-1)
 
+        #calculate loss using probs
         loss = 0.0
         loss_list = []
         if loss_type == PPLM_BOW or loss_type == PPLM_BOW_DISCRIM:
@@ -230,6 +236,7 @@ def perturb_past(
                     inputs_embeds=inputs_embeds
                 )
                 curr_hidden = curr_all_hidden[-1]
+                #
                 new_accumulated_hidden = new_accumulated_hidden + torch.sum(
                     curr_hidden, dim=1)
 
@@ -245,16 +252,22 @@ def perturb_past(
             loss += discrim_loss
             loss_list.append(discrim_loss)
 
+        #calculate kl loss
         kl_loss = 0.0
         if kl_scale > 0.0:
+            #get the unperturbed prob dist
             unpert_probs = F.softmax(unpert_logits[:, -1, :], dim=-1)
+            #smoothing
             unpert_probs = (
                     unpert_probs + SMALL_CONST *
                     (unpert_probs <= SMALL_CONST).float().to(device).detach()
             )
+            #add the same amount to perturbed probs
             correction = SMALL_CONST * (probs <= SMALL_CONST).float().to(
                 device).detach()
             corrected_probs = probs + correction.detach()
+
+            #calculate KL divergence
             kl_loss = kl_scale * (
                 (corrected_probs * (corrected_probs / unpert_probs).log()).sum()
             )
@@ -268,8 +281,9 @@ def perturb_past(
 
         # compute gradients
         loss.backward()
+        breakpoint()
 
-        # calculate gradient norms
+        # calculate gradient norms ??? what does this mean
         if grad_norms is not None and loss_type == PPLM_BOW:
             grad_norms = [
                 torch.max(grad_norms[index], torch.norm(p_.grad * window_mask))
@@ -362,6 +376,22 @@ def get_classifier(
 
     return classifier, label_id
 
+def get_classifier_new(model_path, meta_path,device):
+   
+    with open(meta_path, 'r') as discrim_meta_file:
+        params = json.load(discrim_meta_file)
+
+    classifier = ClassificationHead(
+        class_size=params['class_size'],
+        embed_size=params['embed_size']
+    ).to(device)
+
+    classifier.load_state_dict(
+        torch.load(model_path, map_location=device))
+    classifier.eval()
+
+    return classifier
+
 
 def get_bag_of_words_indices(bag_of_words_ids_or_paths: List[str], tokenizer) -> \
         List[List[List[int]]]:
@@ -376,6 +406,22 @@ def get_bag_of_words_indices(bag_of_words_ids_or_paths: List[str], tokenizer) ->
         bow_indices.append(
             [tokenizer.encode(word.strip(),
                               add_prefix_space=True,
+                              add_special_tokens=False)
+             for word in words])
+    return bow_indices
+
+def get_bag_of_words_indices_bert(bag_of_words_ids_or_paths: List[str], tokenizer) -> \
+        List[List[List[int]]]:
+    bow_indices = []
+    for id_or_path in bag_of_words_ids_or_paths:
+        if id_or_path in BAG_OF_WORDS_ARCHIVE_MAP:
+            filepath = cached_path(BAG_OF_WORDS_ARCHIVE_MAP[id_or_path])
+        else:
+            filepath = id_or_path
+        with open(filepath, "r") as f:
+            words = f.read().strip().split("\n")
+        bow_indices.append(
+            [tokenizer.encode(word.strip(),
                               add_special_tokens=False)
              for word in words])
     return bow_indices
@@ -553,7 +599,7 @@ def generate_text_pplm(
         range_func = range(length)
 
     for i in range_func:
-
+        # add one word at a time
         # Get past/probs for current output, except for last word
         # Note that GPT takes 2 inputs: past + current_token
 
@@ -561,12 +607,13 @@ def generate_text_pplm(
         if past is None and output_so_far is not None:
             last = output_so_far[:, -1:]
             if output_so_far.shape[1] > 1:
+                #leave out the last??
                 _, past, _ = model(output_so_far[:, :-1])
-
+        #prediction_scores, past, hidden
         unpert_logits, unpert_past, unpert_all_hidden = model(output_so_far)
         unpert_last_hidden = unpert_all_hidden[-1]
 
-        # check if we are abowe grad max length
+        # check if we are above grad max length
         if i >= grad_length:
             current_stepsize = stepsize * 0
         else:
@@ -578,9 +625,12 @@ def generate_text_pplm(
 
         else:
             accumulated_hidden = unpert_last_hidden[:, :-1, :]
+            #adding the hidden rep of the whole sentence together?
             accumulated_hidden = torch.sum(accumulated_hidden, dim=1)
 
             if past is not None:
+                ###len(past) = 24, all the layers of gpt2-medium
+                ###past[0].shape torch.Size([2, 1, 16, 2, 64]), 16 heads,2 words,  64 dim each
                 pert_past, _, grad_norms, loss_this_iter = perturb_past(
                     past,
                     model,
@@ -603,11 +653,13 @@ def generate_text_pplm(
                     device=device,
                     verbosity_level=verbosity_level
                 )
+
                 loss_in_time.append(loss_this_iter)
             else:
                 pert_past = past
 
         pert_logits, past, pert_all_hidden = model(last, past=pert_past)
+
         pert_logits = pert_logits[:, -1, :] / temperature  # + SMALL_CONST
         pert_probs = F.softmax(pert_logits, dim=-1)
 
@@ -931,6 +983,6 @@ if __name__ == '__main__':
                         choices=(
                             "quiet", "regular", "verbose", "very_verbose"),
                         help="verbosiry level")
-
+    print (150 * '*')
     args = parser.parse_args()
     run_pplm_example(**vars(args))
