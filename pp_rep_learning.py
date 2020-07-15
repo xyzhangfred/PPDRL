@@ -20,83 +20,128 @@ from loss_funcs import NTXentLoss
 
 
 
-def perturb_hidden(model, all_hidden,masks,labels, classifier, args, only_last = True,num_iterations=1):
+def perturb_hidden(model, all_hidden,masks,labels, classifier, args,  num_iterations=1):
     #
 
     """
     function for shifting the hidden states of Bert
     :param model: bert model
     :param all_hidden: the hidden states before shifting, [batch_size, layer_num, hidden_dim]
-    :classifier the pre-trained classifier 
+    :classifier the pre-trained classifier
+    :param only_last: if true, means we only update the last layer of the bert embedding. if not, means we 
+    update all the layers. Would have to execute Bert layer by layer to do that
     :return: the shifted hidden-states
     """
-    last_hidden_old = all_hidden[-1].clone()
     device = args.device
+    #if do avg, we feed the average hidden states to the classifier, if not, feed the [cls] token.
+    do_avg = args.do_avg
+    only_last = args.only_last
+
+    last_hidden_old = all_hidden[-1].clone()
     if only_last:
         grad_accumulator = (np.zeros(all_hidden[-1].shape).astype("float32"))
     else: 
         grad_accumulator = [ (np.zeros(h.shape).astype("float32")) for h in all_hidden ]
     # accumulate perturbations for num_iterations
-    new_accumulated_hidden = None
     sentence_length = masks.sum(1)
     #masked token = 1, unmasked = 0
 
     #we never modify the accumulated_hidden of unmasked tokens!
+
     for i in range(num_iterations):
         #in each iteration, update something
-        curr_perturbation = to_var(torch.from_numpy(grad_accumulator), requires_grad=True, device=device)
-        unmasked_perturbation = curr_perturbation * masks.unsqueeze(-1)
+        if only_last:
+            curr_perturbation = to_var(torch.from_numpy(grad_accumulator), requires_grad=True, device=device)
+            unmasked_perturbation = curr_perturbation * masks.unsqueeze(-1)
+            perturbed_hidden = all_hidden[-1] + unmasked_perturbation
+        else:
+            curr_perturbation = [to_var(torch.from_numpy(p_), requires_grad=True, device=device) for p_ in grad_accumulator ]
+            perturbed_hidden = list(map(add, all_hidden, curr_perturbation))
+            
         #zero out masked indices
 
         # Compute hidden using perturbed hidden
         # perturbed_hidden = list(map(add, all_hidden[-1], unmasked_perturbation))
-        perturbed_hidden = all_hidden[-1] + unmasked_perturbation
-       
-        new_accumulated_hidden = (perturbed_hidden * masks.unsqueeze(-1)).sum(1)
         loss = 0.0
-        
         ce_loss = torch.nn.CrossEntropyLoss()
+        if do_avg:
+            new_accumulated_hidden = (perturbed_hidden * masks.unsqueeze(-1)).sum(1)
+            
+            #TODO do we include the bos and eos tokens?
+            predictions = classifier(new_accumulated_hidden /
+                                    sentence_length.unsqueeze(1))
+        #use [cls] but only update directly
+        elif only_last:
+            predictions = classifier(perturbed_hidden[:,0])
+        else:
+            input_shape = all_hidden[0].size()
+            extended_masks =  model.get_extended_attention_mask(masks,input_shape, device)
+            new_hidden = [h for h in all_hidden]
+            for layer_no,layer in enumerate(model.encoder.layer):
+                #calculate the output of this layer by applying the module of this layer to hidden of previous layers
+                #mask???
+                new_hidden[layer_no+1] = layer(hidden_states = perturbed_hidden[layer_no],attention_mask=extended_masks)[0] 
+            #we would have to manually pass the hidden vec through each layer of bert
+            #use last layer hidden output for prediction
+            predictions = classifier(new_hidden[-1][:,0]) 
+            # getBack(loss.grad_fn)
 
-        #TODO do we include the bos and eos tokens?
-        predictions = classifier(new_accumulated_hidden /
-                                sentence_length.unsqueeze(1))
-
-        new_labels = torch.tensor(1-labels,
-                                device=device,
-                                dtype=torch.long)
+        new_labels = torch.tensor(1-labels, device=device, dtype=torch.long)
         #had to have a dimension for batchsize
         discrim_loss = ce_loss(predictions, new_labels).sum()
         loss += discrim_loss
 
         reg_w = args.reg_weight
-        reg = torch.norm(curr_perturbation)
+        if only_last:
+            reg = torch.norm(curr_perturbation)
+
+        else:
+            reg = sum([torch.norm(p) for p in curr_perturbation])
         loss += reg_w * reg
 
         # compute gradients
         loss.backward(retain_graph=True)
         # calculate gradient norms
-        grad_norms = torch.norm(curr_perturbation.grad + 1e-7)  
-        # normalize gradients
-        grad = -args.stepsize * (curr_perturbation.grad/ grad_norms ** args.gamma).data.cpu().numpy()
+        if only_last:
+            grad_norms = torch.norm(curr_perturbation.grad + 1e-7)  
+            # normalize gradients
+            grad = -args.stepsize * (curr_perturbation.grad/ grad_norms ** args.gamma).data.cpu().numpy()
+            grad_accumulator += grad
+            curr_perturbation.grad.data.zero_()
+            grad_accumulator = to_var(torch.from_numpy(grad_accumulator), requires_grad=True, device=device)
+            perturbed_last_hidden = all_hidden[-1]+ grad_accumulator
+        else:
+            grad_norms = [ (torch.norm(p_.grad) + 1e-7)
+                for index, p_ in enumerate(curr_perturbation)]
+            grad = [-args.stepsize * (p_.grad / grad_norms[index] ** args.gamma).data.cpu().numpy()
+            for index, p_ in enumerate(curr_perturbation)]
 
-        # accumulate gradient
-        # grad_accumulator = list(map(add, grad, grad_accumulator))
-        grad_accumulator += grad
-        # reset gradients, just to make sure
-        curr_perturbation.grad.data.zero_()
+            grad_accumulator = list(map(add, grad, grad_accumulator))
+            for p_ in curr_perturbation:
+                p_.grad.data.zero_()
+            
+    if not only_last:
+        grad_accumulator = [
+                to_var(torch.from_numpy(p_), requires_grad=True, device=device)
+                for p_ in grad_accumulator
+            ]
+        perturbed_hidden = list(map(add, all_hidden, grad_accumulator))
+        input_shape = all_hidden[0].size()
+        extended_masks =  model.get_extended_attention_mask(masks,input_shape, device)
+        new_hidden = [h for h in all_hidden]
+        for layer_no,layer in enumerate(model.encoder.layer):
+            #calculate the output of this layer by applying the module of this layer to hidden of previous layers
+            #mask???
+            new_hidden[layer_no+1] = layer(hidden_states = perturbed_hidden[layer_no],attention_mask=extended_masks)[0] 
+        perturbed_last_hidden = new_hidden[-1]
     # apply the accumulated perturbations to the past
     ##
-    grad_accumulator = to_var(torch.from_numpy(grad_accumulator), requires_grad=True, device=device)
-    perturbed_last_hidden = all_hidden[-1]+ grad_accumulator
-    last_hidden_new = all_hidden[-1].clone()
-
+    #always output the whole last hidden layer
     return perturbed_last_hidden
 
 
-
-
 class Projector(nn.Module):
-    def __init__(self, input_dim, output_dim = 256, hidden_dim = None):
+    def __init__(self, input_dim, output_dim = 256, hidden_dim = None, do_avg = True):
         super(Projector, self).__init__()
         if hidden_dim is None:
             hidden_dim = output_dim
@@ -105,13 +150,16 @@ class Projector(nn.Module):
           nn.ReLU(),
           nn.Linear(hidden_dim,output_dim),
         )
+        self.do_avg = do_avg
 
-    def forward(self, hidden, mask):
-        sent_length = mask.sum(1).unsqueeze(1)
-
-        sum_hidden = (hidden * mask.unsqueeze(-1)).sum(1)
-        avg_hidden = sum_hidden/sent_length
-        z = self.mlp(avg_hidden)
+    def forward(self, last_hidden, mask):
+        if self.do_avg:
+            accumulated_hidden = (last_hidden*mask.unsqueeze(-1)).sum(1)
+            sentence_length = mask.sum(1)
+            pooled_hidden = accumulated_hidden/sentence_length.unsqueeze(1)
+        else:
+            pooled_hidden = last_hidden[:,0]
+        z = self.mlp(pooled_hidden)
         return z
 
 
@@ -130,14 +178,16 @@ def eval_loss(model, classifier, projector, eval_dataloader, args, tb_writer, cu
             if len(batch[0]) < args.eval_batch_size:
                 continue
             inputs = {'input_ids':      batch[0],
-                        'attention_mask': batch[1],
-                        'token_type_ids': batch[2]}
+                      'attention_mask': batch[1],
+                      'token_type_ids': batch[2]}
             last_hidden, pooler_output, all_hidden = model(**inputs)
         pert_last_hidden = perturb_hidden(model=model,all_hidden=all_hidden,masks=batch[1],labels=batch[3],\
-                classifier=classifier,args = args,only_last= True,num_iterations=5)
+                classifier=classifier,args = args,num_iterations=5)
         with torch.no_grad():
+            #TODO: Change to [cls] or avg
             z = projector(last_hidden,batch[1])
             pert_z = projector(pert_last_hidden,batch[1])
+
             if args.loss_type == 'triplet':
                 neg_idx = torch.randperm(n=len(batch[0]))
                 neg_z = z[neg_idx,:]
@@ -162,6 +212,7 @@ def eval_probe(model, projector, eval_dataloader, args, tb_writer, labels,curr_s
                     'token_type_ids': batch[2]}
         with torch.no_grad():
             last_hidden, pooler_output, all_hidden = model(**inputs)
+            #TODO: Change to [cls] or avg
             z = projector(last_hidden,batch[1])
             if all_z is None:
                 all_z = z
@@ -293,15 +344,25 @@ def pdist_torch(emb1, emb2):
     dist_mtx = dist_mtx.clamp(min = 1e-12).sqrt()
     return dist_mtx
 
-def get_score_hidden(hidden,mask,label, model, classifier, device):
-    accumulated_hidden = (hidden*mask.unsqueeze(-1)).sum(1)
-    sentence_length = mask.sum(1)
-    scores = F.softmax(classifier(accumulated_hidden / sentence_length.unsqueeze(-1)))
+def get_score_hidden(last_hidden,mask,label, model, classifier, device, do_avg):
+
+    ###hidden should either be the average hidden or the [cls] vector.
+    if do_avg:
+        accumulated_hidden = (last_hidden*mask.unsqueeze(-1)).sum(1)
+        sentence_length = mask.sum(1)
+        hidden = accumulated_hidden/sentence_length.unsqueeze(1)
+    else:
+        hidden = last_hidden[:,0]
+    scores = F.softmax(classifier(hidden))
     pred = scores.argmax(1)
     acc = ((pred==label).sum().item())/len(pred)
     return scores,acc
 
-
+# def get_average(all_hidden, mask):
+#     accumulated_hidden = (all_hidden*mask.unsqueeze(-1)).sum(1)
+#     sentence_length = mask.sum(1)
+#     avg_hidden = accumulated_hidden/sentence_length.unsqueeze(1)
+#     return avg_hidden
 
 def main():
     parser = argparse.ArgumentParser()
@@ -345,6 +406,11 @@ def main():
                         help="tensorboard dir")
     parser.add_argument("--loss_type", default='clr', type=str,    
                         help="clr or triplet")
+    parser.add_argument("--do_avg", default=False, action='store_true',
+                        help="if true, use the average hidden states, else, use the [cls] token")
+    parser.add_argument("--only_last", default=False, action='store_true',
+                        help="if true, only update last_hidden, else, update all the layers")
+
     args = parser.parse_args()
     args.device = torch.device("cuda")
     if not os.path.exists(args.out_dir):
@@ -374,13 +440,16 @@ def main():
         train_main_labels = train_sentiments
         eval_main_labels = eval_sentiments
 
-    if not args.dataset == 'moji_finetune':
+
+    if  args.dataset in ['moji', 'yelp','imdb']:
         train_num = int(len(sents) * 0.9)
         print ('train num:', train_num)
         train_labels = labels[:train_num]
         train_sents = sents[:train_num]
         eval_labels = labels[train_num:]
         eval_sents = sents[train_num:]
+
+
     if args.dataset == 'imdb':
         max_seq_length = 512
         eval_main_labels = sentiments[train_num:]
@@ -418,7 +487,7 @@ def main():
     eval_input_features = convert_examples_to_features(examples = eval_input_examples, label_list=label_list, max_seq_length = max_seq_length, tokenizer=tokenizer)
     eval_dataloader = get_dataloader(eval_input_features, batch_size=args.eval_batch_size)
 
-    projector = Projector(input_dim=768)
+    projector = Projector(input_dim=768, do_avg = args.do_avg)
     projector.train()
     projector.to(args.device)
     tb_writer = SummaryWriter(os.path.join(args.out_dir, args.log_dir))
@@ -468,10 +537,12 @@ def main():
                         'token_type_ids': batch[2]}
             with torch.no_grad():
                 last_hidden, pooler_output, all_hidden = model(**inputs)
-            scores_before, acc_before = get_score_hidden(hidden= last_hidden, mask=batch[1],label=batch[3],model=model,classifier=classifier,device=args.device)
+            scores_before, acc_before = get_score_hidden(last_hidden= last_hidden, mask=batch[1],label=batch[3],model=model,\
+                classifier=classifier,device=args.device, do_avg = args.do_avg)
             pert_last_hidden = perturb_hidden(model=model,all_hidden=all_hidden,masks=batch[1],labels=batch[3],\
-                classifier=classifier,args = args,only_last= True,num_iterations=args.pert_iter)
-            scores_after, acc_after= get_score_hidden(hidden=pert_last_hidden, mask=batch[1],label=batch[3],model=model,classifier=classifier,device=args.device)
+                classifier=classifier,args = args,num_iterations=args.pert_iter)
+            scores_after, acc_after= get_score_hidden(last_hidden=pert_last_hidden, mask=batch[1],label=batch[3],model=model,\
+                classifier=classifier,device=args.device, do_avg = args.do_avg)
             if global_step < 50:
                 print(" acc_before:{}, ".format(acc_before))
                 print("acc_after:{}, ".format(acc_after))
@@ -483,6 +554,7 @@ def main():
                 print("global_step:{}, average acc_after:{}, ".format(global_step, np.mean(all_acc_after)))
                 tb_writer.add_scalar('train_accs/acc_before',np.mean(all_acc_before), global_step )
                 tb_writer.add_scalar('train_accs/acc_after',np.mean(all_acc_after), global_step )
+            #TODO Change to avg or cls
             z = projector(last_hidden,batch[1])
             pert_z = projector(pert_last_hidden,batch[1])
             

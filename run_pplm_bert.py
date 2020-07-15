@@ -500,8 +500,8 @@ def generate_text_pplm_bert(
                 verbosity_level=verbosity_level
             )
             loss_in_time.append(loss_this_iter)
-        else:
-            pert_past = past
+        # else:
+        #     pert_past = past
     #feed the perturbed hidden representations to the model and get new hidden representations
     # Oh no, we need to feed the hidden representations instead of input ids to the model!!!! Argh!
     last_hidden = pert_all_hidden[-1]

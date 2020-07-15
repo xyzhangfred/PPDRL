@@ -29,7 +29,7 @@ import torch
 import torch.optim as optim
 
 from bert_util import tokenize, InputExample, convert_examples_to_features,get_dataloader
-from data_util import load_yelp, load_imdb, load_moji_split
+from data_util import load_yelp, load_imdb, load_moji_split,load_MD
 from transformers import BertTokenizer, BertForSequenceClassification
 
 from pp_rep_learning import calc_tpr
@@ -181,7 +181,7 @@ def main():
                         help="The pretrained transformer model")
 
     parser.add_argument("--dataset", default='moji', type=str,    
-                        help="pick from yelp, imdb, moji")
+                        help="pick from yelp, imdb, moji, MD")
     parser.add_argument("--dataset_fp", default='/home/xiongyi/dataxyz/data/demog-text-removal/sentiment_race/r0s0_0.1', type=str,    
                         help="dataset file path")
     parser.add_argument("--epochs", type=int, default=3, metavar="N",
@@ -228,7 +228,13 @@ def main():
         train_prot_labels = train_races
         eval_main_labels = eval_sentiments
         eval_prot_labels = eval_races
-        
+    elif args.dataset == 'MD':
+        train_genders,train_scores, train_sents = load_MD(file_dir = args.dataset_fp, prefix = 'train')
+        eval_genders,eval_scores, eval_sents = load_MD(file_dir = args.dataset_fp, prefix = 'eval')
+        train_main_labels = train_scores
+        train_prot_labels = train_genders
+        eval_main_labels = eval_scores
+        eval_prot_labels = eval_genders
     #if train on only one group
     if args.protected_group is not None:
         train_idx = [i for i in range(len(train_sents)) if train_prot_labels[i] == args.protected_group]
@@ -248,6 +254,10 @@ def main():
         label_list = ['0', '1']
 
     elif args.dataset == 'moji':
+        max_seq_length = 128
+        label_list = [0, 1]
+
+    elif args.dataset == 'MD':
         max_seq_length = 128
         label_list = [0, 1]
 
